@@ -144,13 +144,17 @@ app.get("/health", (req, res) => {
 
 let transport: SSEServerTransport;
 
+// Håndter SSE forbindelse (GET)
 app.get("/sse", async (req, res) => {
   console.log("Ny SSE forbindelse oprettet");
-  transport = new SSEServerTransport("/message", res);
+  // Vi fortæller klienten: "Send dine beskeder tilbage til /sse"
+  transport = new SSEServerTransport("/sse", res);
   await server.connect(transport);
 });
 
-app.post("/message", async (req, res) => {
+// Håndter beskeder på SAMME adresse (POST)
+app.post("/sse", async (req, res) => {
+  console.log("Modtog besked på /sse");
   if (!transport) {
     res.status(500).send("SSE forbindelse mangler");
     return;
