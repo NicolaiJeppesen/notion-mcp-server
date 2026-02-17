@@ -10,7 +10,6 @@ import express from "express";
 import cors from "cors";
 
 // 1. Konfigurer Notion Client
-// Henter nøglen fra Railway variablen NOTION_API_KEY
 const notion = new Client({
   auth: process.env.NOTION_API_KEY,
 });
@@ -79,6 +78,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // 4. Håndter Værktøjs-kald
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  console.log(`Udfører værktøj: ${name}`); // Log hvilke værktøjer der kaldes
 
   try {
     switch (name) {
@@ -126,6 +126,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error(`Fejl i værktøj ${name}:`, errorMessage);
     return {
       content: [{ type: "text", text: `Fejl: ${errorMessage}` }],
       isError: true,
@@ -136,29 +137,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // 5. Start Express Webserveren (SSE)
 const app = express();
 app.use(cors());
+app.use(express.json()); // VIGTIGT: Tillad JSON parsing
+
+// LOG ALLE REQUESTS (Så vi kan se hvad n8n gør)
+app.use((req, res, next) => {
+    console.log(`[HTTP] ${req.method} ${req.url}`);
+    next();
+});
 
 // Health check til Railway
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
 });
 
-let transport: SSEServerTransport;
+let transport: SSEServerTransport | null = null;
 
-// Håndter SSE forbindelse (GET)
+// Håndter SSE forbindelse (GET) - n8n skal ramme denne FØRST
 app.get("/sse", async (req, res) => {
-  console.log("Ny SSE forbindelse oprettet");
-  // Vi fortæller klienten: "Send dine beskeder tilbage til /sse"
+  console.log("Ny SSE forbindelse starter...");
+  
   transport = new SSEServerTransport("/sse", res);
   await server.connect(transport);
+  
+  console.log("SSE forbindelse etableret!");
 });
 
-// Håndter beskeder på SAMME adresse (POST)
+// Håndter beskeder (POST)
 app.post("/sse", async (req, res) => {
-  console.log("Modtog besked på /sse");
   if (!transport) {
-    res.status(500).send("SSE forbindelse mangler");
+    console.error("FEJL: Modtog POST men ingen transport er aktiv. (Mangler GET kald først?)");
+    res.status(500).send("Ingen aktiv SSE forbindelse fundet. Genstart n8n noden.");
     return;
   }
+  
+  console.log("Håndterer besked via eksisterende transport");
   await transport.handlePostMessage(req, res);
 });
 
