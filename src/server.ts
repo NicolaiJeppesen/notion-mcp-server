@@ -9,36 +9,27 @@ import { Client } from "@notionhq/client";
 import express from "express";
 import cors from "cors";
 
-// 1. Konfigurer Notion Client
+// 1. Tjek om API nøglen er der
+if (!process.env.NOTION_API_KEY) {
+  console.error("FEJL: NOTION_API_KEY mangler i Railway Variables!");
+}
+
 const notion = new Client({
   auth: process.env.NOTION_API_KEY,
 });
 
-const TOOLS = {
-  SEARCH: "notion_search",
-  APPEND_BLOCK: "notion_append_block",
-  GET_PAGE: "notion_get_page",
-};
-
 // 2. Opret MCP Serveren
 const server = new Server(
-  {
-    name: "notion-mcp-server",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
+  { name: "notion-mcp-server", version: "1.0.1" },
+  { capabilities: { tools: {} } }
 );
 
-// 3. Definer Værktøjerne (Tools)
+// --- DEFINER TOOLS ---
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
-        name: TOOLS.SEARCH,
+        name: "notion_search",
         description: "Søg efter sider eller databaser i Notion",
         inputSchema: {
           type: "object",
@@ -49,7 +40,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: TOOLS.GET_PAGE,
+        name: "notion_get_page",
         description: "Hent indholdet (blokke) fra en side",
         inputSchema: {
           type: "object",
@@ -58,123 +49,78 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["block_id"],
         },
-      },
-      {
-        name: TOOLS.APPEND_BLOCK,
-        description: "Tilføj indhold til bunden af en side",
-        inputSchema: {
-          type: "object",
-          properties: {
-            block_id: { type: "string", description: "ID på siden du vil skrive på" },
-            content: { type: "string", description: "Teksten der skal indsættes" },
-          },
-          required: ["block_id", "content"],
-        },
-      },
+      }
     ],
   };
 });
 
-// 4. Håndter Værktøjs-kald
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  console.log(`Udfører værktøj: ${name}`); // Log hvilke værktøjer der kaldes
-
   try {
-    switch (name) {
-      case TOOLS.SEARCH: {
-        const query = String(args?.query);
-        const results = await notion.search({
-          query,
-          page_size: 5,
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
-        };
-      }
-      case TOOLS.GET_PAGE: {
-        const blockId = String(args?.block_id);
-        const response = await notion.blocks.children.list({
-          block_id: blockId,
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-        };
-      }
-      case TOOLS.APPEND_BLOCK: {
-        const blockId = String(args?.block_id);
-        const content = String(args?.content);
-        
-        const response = await notion.blocks.children.append({
-          block_id: blockId,
-          children: [
-            {
-              object: "block",
-              type: "paragraph",
-              paragraph: {
-                rich_text: [{ type: "text", text: { content } }],
-              },
-            },
-          ],
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-        };
-      }
-      default:
-        throw new Error(`Ukendt værktøj: ${name}`);
+    if (name === "notion_search") {
+        const results = await notion.search({ query: String(args?.query), page_size: 5 });
+        return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
     }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`Fejl i værktøj ${name}:`, errorMessage);
-    return {
-      content: [{ type: "text", text: `Fejl: ${errorMessage}` }],
-      isError: true,
-    };
+    if (name === "notion_get_page") {
+        const response = await notion.blocks.children.list({ block_id: String(args?.block_id) });
+        return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+    }
+    throw new Error(`Ukendt værktøj: ${name}`);
+  } catch (error: any) {
+    return { content: [{ type: "text", text: `Fejl: ${error.message}` }], isError: true };
   }
 });
 
-// 5. Start Express Webserveren (SSE)
+// --- SERVER SETUP ---
 const app = express();
 app.use(cors());
-app.use(express.json()); // VIGTIGT: Tillad JSON parsing
 
-// LOG ALLE REQUESTS (Så vi kan se hvad n8n gør)
-app.use((req, res, next) => {
-    console.log(`[HTTP] ${req.method} ${req.url}`);
-    next();
+// Vigtigt: Root GET så vi kan tjekke om serveren lever i en browser
+app.get("/", (req, res) => {
+    res.send("Notion MCP Server kører! Brug /mcp endpointet i n8n.");
 });
 
-// Health check til Railway
-app.get("/health", (req, res) => {
-  res.status(200).send("OK");
-});
+// Gemmer aktive forbindelser
+const transports = new Map<string, SSEServerTransport>();
 
-let transport: SSEServerTransport | null = null;
-
-// Håndter SSE forbindelse (GET) - n8n skal ramme denne FØRST
-app.get("/sse", async (req, res) => {
-  console.log("Ny SSE forbindelse starter...");
+// 1. n8n kalder denne først (GET) for at åbne strømmen
+app.get("/mcp", async (req, res) => {
+  console.log("Opretter ny SSE forbindelse...");
+  const transport = new SSEServerTransport("/mcp", res);
   
-  transport = new SSEServerTransport("/sse", res);
+  // Gem transporten i vores map (vi bruger en simpel nøgle her for n8n)
+  transports.set("n8n-session", transport);
+  
   await server.connect(transport);
   
-  console.log("SSE forbindelse etableret!");
+  req.on("close", () => {
+    console.log("Forbindelse lukket.");
+    transports.delete("n8n-session");
+  });
 });
 
-// Håndter beskeder (POST)
-app.post("/sse", async (req, res) => {
+// 2. n8n sender beskeder her (POST)
+app.post("/mcp", express.json(), async (req, res) => {
+  const transport = transports.get("n8n-session");
+  
   if (!transport) {
-    console.error("FEJL: Modtog POST men ingen transport er aktiv. (Mangler GET kald først?)");
-    res.status(500).send("Ingen aktiv SSE forbindelse fundet. Genstart n8n noden.");
+    console.warn("Modtog POST men ingen GET forbindelse endnu. Prøver at vente 500ms...");
+    // Giv den lige en chance hvis n8n er for hurtig
+    setTimeout(async () => {
+        const retryTransport = transports.get("n8n-session");
+        if (retryTransport) {
+            await retryTransport.handlePostMessage(req, res);
+        } else {
+            res.status(500).send("Ingen aktiv session. Prøv at køre n8n noden igen.");
+        }
+    }, 500);
     return;
   }
-  
-  console.log("Håndterer besked via eksisterende transport");
+
   await transport.handlePostMessage(req, res);
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Notion MCP Server kører på port ${PORT}`);
+  console.log(`Server kører på port ${PORT}`);
 });
